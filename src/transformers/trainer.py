@@ -1130,19 +1130,7 @@ class Trainer:
                     seed_worker, num_workers=self.args.dataloader_num_workers, rank=self.args.process_index
                 )
 
-        # For KT (KTransformers), skip accelerate's dataloader preparation.
-        # KT MoE requires all ranks to receive identical batches for the broadcast path.
-        # Using accelerate.prepare() would shard data across ranks, breaking this requirement.
-        # We also need to ensure all ranks use the same random seed for sampling.
-        if self.is_kt_enabled:
-            # Replace sampler with a seeded one to ensure all ranks get identical batches
-            if "sampler" in dataloader_params and isinstance(dataloader_params["sampler"], RandomSampler):
-                generator = torch.Generator()
-                generator.manual_seed(self.args.seed)
-                dataloader_params["sampler"] = RandomSampler(dataset, generator=generator)
-            dataloader = DataLoader(dataset, **dataloader_params)
-        else:
-            dataloader = self.accelerator.prepare(DataLoader(dataset, **dataloader_params))
+        dataloader = self.accelerator.prepare(DataLoader(dataset, **dataloader_params))
 
         # Store the prepared dataloader for subsequent evaluations if using persistent workers.
         if dataloader_key is not None and self.args.dataloader_persistent_workers:
@@ -4361,9 +4349,36 @@ class Trainer:
             self._save(output_dir)
         elif self.is_fsdp_enabled:
             if "FULL_STATE_DICT" in str(self.accelerator.state.fsdp_plugin.state_dict_type):
-                state_dict = self.accelerator.get_state_dict(self.model)
-                if self.args.should_save:
-                    self._save(output_dir, state_dict=state_dict)
+                if self.is_kt_enabled:
+                    # KT + FSDP2: use FSDP2 state dict to gather sharded PEFT adapter
+                    # weights, then save only the adapter + KT MoE LoRA.
+                    from torch.distributed.checkpoint.state_dict import get_model_state_dict, StateDictOptions
+                    options = StateDictOptions(full_state_dict=True, cpu_offload=True)
+                    state_dict = get_model_state_dict(self.model, options=options)
+                    if self.args.should_save:
+                        unwrapped = self.accelerator.unwrap_model(self.model, keep_torch_compile=False)
+                        os.makedirs(output_dir, exist_ok=True)
+                        # Filter to only trainable (adapter) parameters
+                        trainable_keys = {
+                            name for name, p in unwrapped.named_parameters() if p.requires_grad
+                        }
+                        adapter_state = {k: v for k, v in state_dict.items() if k in trainable_keys}
+                        # Save via PEFT's save_pretrained with explicit state_dict
+                        if isinstance(unwrapped, PeftModel):
+                            unwrapped.save_pretrained(
+                                output_dir,
+                                state_dict=adapter_state,
+                                safe_serialization=self.args.save_safetensors,
+                            )
+                        # Append MoE LoRA to the adapter file
+                        save_kt_moe_to_adapter(unwrapped, output_dir)
+                        if self.processing_class is not None:
+                            self.processing_class.save_pretrained(output_dir)
+                        torch.save(self.args, os.path.join(output_dir, TRAINING_ARGS_NAME))
+                else:
+                    state_dict = self.accelerator.get_state_dict(self.model)
+                    if self.args.should_save:
+                        self._save(output_dir, state_dict=state_dict)
         elif self.is_deepspeed_enabled:
             try:
                 state_dict = self.accelerator.get_state_dict(self.deepspeed)
@@ -4502,7 +4517,7 @@ class Trainer:
         # Good practice: save your training arguments together with the trained model
         torch.save(self.args, os.path.join(output_dir, TRAINING_ARGS_NAME))
 
-        if self.is_kt_enabled:
+        if self.is_kt_enabled and self.args.should_save:
             kt_model = self.accelerator.unwrap_model(self.model, keep_torch_compile=False)
             save_kt_moe_to_adapter(kt_model, output_dir)
 

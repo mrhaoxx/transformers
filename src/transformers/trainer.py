@@ -219,6 +219,8 @@ else:
 if is_peft_available():
     from peft import PeftModel
 
+_accelerate_supports_kt_config = False
+
 if is_accelerate_available():
     from accelerate import Accelerator, skip_first_batches
     from accelerate import __version__ as accelerate_version
@@ -232,6 +234,20 @@ if is_accelerate_available():
         save_fsdp_model,
         save_fsdp_optimizer,
     )
+
+    try:
+        from accelerate.utils import (
+            KTransformersPlugin,
+            get_kt_lora_params,
+            save_kt_moe_to_adapter,
+            sync_kt_lora_gradients,
+            update_kt_lora_pointers,
+        )
+
+        _accelerate_supports_kt_config = "kt_config" in inspect.signature(Accelerator).parameters
+    except ImportError:
+        KTransformersPlugin = None
+        get_kt_lora_params = save_kt_moe_to_adapter = sync_kt_lora_gradients = update_kt_lora_pointers = None
 
     DATA_SAMPLERS = [RandomSampler]
     if version.parse(accelerate_version) > version.parse("1.3.0"):
@@ -1114,7 +1130,19 @@ class Trainer:
                     seed_worker, num_workers=self.args.dataloader_num_workers, rank=self.args.process_index
                 )
 
-        dataloader = self.accelerator.prepare(DataLoader(dataset, **dataloader_params))
+        # For KT (KTransformers), skip accelerate's dataloader preparation.
+        # KT MoE requires all ranks to receive identical batches for the broadcast path.
+        # Using accelerate.prepare() would shard data across ranks, breaking this requirement.
+        # We also need to ensure all ranks use the same random seed for sampling.
+        if self.is_kt_enabled:
+            # Replace sampler with a seeded one to ensure all ranks get identical batches
+            if "sampler" in dataloader_params and isinstance(dataloader_params["sampler"], RandomSampler):
+                generator = torch.Generator()
+                generator.manual_seed(self.args.seed)
+                dataloader_params["sampler"] = RandomSampler(dataset, generator=generator)
+            dataloader = DataLoader(dataset, **dataloader_params)
+        else:
+            dataloader = self.accelerator.prepare(DataLoader(dataset, **dataloader_params))
 
         # Store the prepared dataloader for subsequent evaluations if using persistent workers.
         if dataloader_key is not None and self.args.dataloader_persistent_workers:
@@ -1336,6 +1364,21 @@ class Trainer:
                         manager.register_module_override(module, "weight", {"optim_bits": 32})
                         logger.debug(f"bitsandbytes: will optimize {module} in fp32")
                 logger.info(f"skipped: {skipped / 2**20}M params")
+
+            if self.is_kt_enabled:
+                kt_model = self.accelerator.unwrap_model(self.model, keep_torch_compile=False)
+                kt_params = get_kt_lora_params(kt_model)
+
+                if kt_params:
+                    optimizer_param_ids = set()
+                    for group in self.optimizer.param_groups:
+                        for param in group["params"]:
+                            optimizer_param_ids.add(id(param))
+
+                    missing_kt_params = [p for p in kt_params if id(p) not in optimizer_param_ids]
+                    if missing_kt_params:
+                        self.optimizer.param_groups[0]["params"].extend(missing_kt_params)
+                        logger.info(f"Added {len(missing_kt_params)} KT LoRA parameters to optimizer group 0")
 
         if is_sagemaker_mp_enabled():
             self.optimizer = smp.DistributedOptimizer(self.optimizer)
@@ -2489,6 +2532,31 @@ class Trainer:
         if self.is_fsdp_enabled:
             self.model = self.model_wrapped = model
 
+        # After accelerator.prepare(), KT wrapping has happened and LoRA params exist.
+        # We need to inject them into the optimizer since it was created before KT wrapping.
+        if self.is_kt_enabled and get_kt_lora_params is not None:
+            kt_model = self.accelerator.unwrap_model(self.model, keep_torch_compile=False)
+            kt_params = get_kt_lora_params(kt_model)
+            if kt_params:
+                # Get the underlying optimizer (unwrap AcceleratedOptimizer if needed)
+                raw_optimizer = self.optimizer
+                if hasattr(raw_optimizer, 'optimizer'):
+                    raw_optimizer = raw_optimizer.optimizer
+
+                existing_ids = set()
+                for group in raw_optimizer.param_groups:
+                    for p in group['params']:
+                        existing_ids.add(id(p))
+
+                missing = [p for p in kt_params if id(p) not in existing_ids]
+                if missing:
+                    raw_optimizer.param_groups[0]['params'].extend(missing)
+                    logger.info(f"[KT] Added {len(missing)} KT LoRA params to optimizer group 0")
+                else:
+                    logger.info(f"[KT] All {len(kt_params)} KT LoRA params already in optimizer")
+            else:
+                logger.warning("[KT] is_kt_enabled but get_kt_lora_params returned empty")
+
         # for the rest of this function `model` is the outside model, whether it was wrapped or not
         if model is not self.model:
             self.model_wrapped = model
@@ -2711,11 +2779,37 @@ class Trainer:
                                     from torch.distributed._tensor.experimental import implicit_replication
 
                                     grad_norm_context = implicit_replication
+                                # for k,v in model.named_parameters():
+                                    # print(dist.get_rank(), k, type(v.grad), v.grad.shape if v.grad is not None else None, v.grad.dtype if v.grad is not None else None)
+                                from torch.distributed.tensor import DTensor
                                 with grad_norm_context():
-                                    _grad_norm = self.accelerator.clip_grad_norm_(
-                                        model.parameters(),
-                                        args.max_grad_norm,
-                                    )
+                                    dt_params, t_params = [], []
+                                    for p in model.parameters():
+                                        if p.grad is None:
+                                            continue
+                                        (dt_params if isinstance(p, DTensor) else t_params).append(p)
+
+                                    # Compute plain tensor grad norm
+                                    t_total_norm_sq = sum(p.grad.float().norm() ** 2 for p in t_params) if t_params else 0.0
+                                    t_total_norm_sq = float(t_total_norm_sq)
+
+                                    # Compute DTensor grad norm (without clipping)
+                                    if dt_params:
+                                        dt_norm = float(torch.nn.utils.clip_grad_norm_(dt_params, float('inf')))
+                                    else:
+                                        dt_norm = 0.0
+
+                                    total_norm = (dt_norm ** 2 + t_total_norm_sq) ** 0.5
+                                    _grad_norm = total_norm
+
+                                    if total_norm > args.max_grad_norm:
+                                        clip_coef = args.max_grad_norm / (total_norm + 1e-6)
+                                        # Clip plain tensors
+                                        for p in t_params:
+                                            p.grad.mul_(clip_coef)
+                                        # Clip DTensors via their local tensors
+                                        for p in dt_params:
+                                            p.grad._local_tensor.mul_(clip_coef)
 
                             if (
                                 is_accelerate_available()
@@ -2730,6 +2824,28 @@ class Trainer:
 
                         self.control = self.callback_handler.on_pre_optimizer_step(args, self.state, self.control)
 
+                        # KT LoRA gradients are already broadcast from rank 0 in backward(),
+                        # so all ranks have identical grads. No need for additional all-reduce.
+                        # if self.is_kt_enabled and sync_kt_lora_gradients is not None:
+                        #     sync_kt_lora_gradients(self.accelerator.unwrap_model(model, keep_torch_compile=False))
+
+                        # # One-time optimizer check for KT LoRA params
+                        # if self.is_kt_enabled and not getattr(self, '_kt_opt_checked', False):
+                        #     self._kt_opt_checked = True
+                        #     kt_m = self.accelerator.unwrap_model(model, keep_torch_compile=False)
+                        #     kt_ps = get_kt_lora_params(kt_m) if get_kt_lora_params else []
+                        #     raw_opt = self.optimizer.optimizer if hasattr(self.optimizer, 'optimizer') else self.optimizer
+                        #     opt_ids = {id(p) for g in raw_opt.param_groups for p in g['params']}
+                        #     found = sum(1 for p in kt_ps if id(p) in opt_ids)
+                        #     for p in kt_ps:
+                        #         g = p.grad
+                        #         print(f"[KT OPT CHECK] id={id(p)} in_opt={id(p) in opt_ids} "
+                        #               f"grad={'%.6f'%g.float().norm().item() if g is not None else 'None'} "
+                        #               f"data_norm={p.data.float().norm().item():.6f} shape={tuple(p.shape)}", flush=True)
+                        #     print(f"[KT OPT CHECK] {found}/{len(kt_ps)} KT LoRA params in optimizer, "
+                        #           f"total opt params={sum(len(g['params']) for g in raw_opt.param_groups)}, "
+                        #           f"num_groups={len(raw_opt.param_groups)}", flush=True)
+
                         context = contextlib.nullcontext
                         if self.is_tp_enabled:
                             from torch.distributed._tensor.experimental import implicit_replication
@@ -2738,6 +2854,41 @@ class Trainer:
 
                         with context():
                             self.optimizer.step()
+
+                        # # Check if optimizer.step() actually updated KT LoRA B params
+                        # if self.is_kt_enabled and getattr(self, '_kt_step_count', 0) < 5:
+                        #     self._kt_step_count = getattr(self, '_kt_step_count', 0) + 1
+                        #     step_n = self._kt_step_count
+                        #     kt_m = self.accelerator.unwrap_model(model, keep_torch_compile=False)
+                        #     kt_ps = get_kt_lora_params(kt_m) if get_kt_lora_params else []
+                        #     raw_opt = self.optimizer.optimizer if hasattr(self.optimizer, 'optimizer') else self.optimizer
+                        #     b_example = None
+                        #     a_example = None
+                        #     b_zero_count = 0
+                        #     b_total = 0
+                        #     for p in kt_ps:
+                        #         is_b = (len(p.shape) == 3 and p.shape[-1] <= 16)
+                        #         if is_b:
+                        #             b_total += 1
+                        #             if p.data.float().norm().item() == 0:
+                        #                 b_zero_count += 1
+                        #             if b_example is None:
+                        #                 b_example = p
+                        #         elif a_example is None:
+                        #             a_example = p
+                        #     lr = raw_opt.param_groups[-1].get('lr', -1)
+                        #     b_state = raw_opt.state.get(b_example, {}) if b_example is not None else {}
+                        #     b_step = b_state.get('step', 'N/A')
+                        #     b_grad = b_example.grad.float().norm().item() if b_example is not None and b_example.grad is not None else -1
+                        #     b_norm = b_example.data.float().norm().item() if b_example is not None else -1
+                        #     a_norm = a_example.data.float().norm().item() if a_example is not None else -1
+                        #     a_grad = a_example.grad.float().norm().item() if a_example is not None and a_example.grad is not None else -1
+                        #     print(f"[KT STEP {step_n}] lr={lr:.2e} B: {b_zero_count}/{b_total} still_zero "
+                        #           f"b_norm={b_norm:.6f} b_grad={b_grad:.6f} b_opt_step={b_step} | "
+                        #           f"A: a_norm={a_norm:.6f} a_grad={a_grad:.6f}", flush=True)
+
+                        if self.is_kt_enabled:
+                            update_kt_lora_pointers(self.accelerator.unwrap_model(model, keep_torch_compile=False))
 
                         self.control = self.callback_handler.on_optimizer_step(args, self.state, self.control)
 
@@ -3464,9 +3615,15 @@ class Trainer:
             save_fsdp_model(
                 self.accelerator.state.fsdp_plugin, self.accelerator, self.model, output_dir, **_get_fsdp_ckpt_kwargs()
             )
-            save_fsdp_optimizer(
-                self.accelerator.state.fsdp_plugin, self.accelerator, self.optimizer, self.model, output_dir
-            )
+            # When KT is enabled, KT LoRA params are not managed by FSDP, so we can't use
+            # save_fsdp_optimizer (it fails to map KT LoRA params). Use regular torch.save instead.
+            if self.is_kt_enabled:
+                if self.args.should_save:
+                    torch.save(self.optimizer.state_dict(), os.path.join(output_dir, OPTIMIZER_NAME))
+            else:
+                save_fsdp_optimizer(
+                    self.accelerator.state.fsdp_plugin, self.accelerator, self.optimizer, self.model, output_dir
+                )
         elif self.args.should_save:
             # deepspeed.save_checkpoint above saves model/optim/sched
             torch.save(self.optimizer.state_dict(), os.path.join(output_dir, OPTIMIZER_NAME))
@@ -3576,7 +3733,7 @@ class Trainer:
                     # In distributed training however, we load directly on each GPU and risk the GPU OOM as it's more
                     # likely to get OOM on CPU (since we load num_gpu times the optimizer state
                     map_location = self.args.device if self.args.world_size > 1 else "cpu"
-                    if self.is_fsdp_enabled:
+                    if self.is_fsdp_enabled and not self.is_kt_enabled:
                         load_fsdp_optimizer(
                             self.accelerator.state.fsdp_plugin,
                             self.accelerator,
@@ -4344,6 +4501,10 @@ class Trainer:
 
         # Good practice: save your training arguments together with the trained model
         torch.save(self.args, os.path.join(output_dir, TRAINING_ARGS_NAME))
+
+        if self.is_kt_enabled:
+            kt_model = self.accelerator.unwrap_model(self.model, keep_torch_compile=False)
+            save_kt_moe_to_adapter(kt_model, output_dir)
 
     def store_flos(self):
         # Storing the number of floating-point operations that went into the model
@@ -5457,6 +5618,7 @@ class Trainer:
                 self.args.gradient_accumulation_steps = grad_acc_kwargs["num_steps"]
 
         accelerator_config = self.args.accelerator_config.to_dict()
+        kt_config_dict = accelerator_config.pop("kt_config", None)
 
         if is_accelerate_available("0.28.0"):
             # Extract dataloader config params from accelerator config
@@ -5485,6 +5647,22 @@ class Trainer:
         args = {
             "deepspeed_plugin": self.args.deepspeed_plugin,
         }
+        if kt_config_dict is not None:
+            if not _accelerate_supports_kt_config:
+                raise ImportError(
+                    "The installed `accelerate` version does not support `kt_config`. "
+                    "Please upgrade `accelerate` or remove `kt_config` from `accelerator_config`."
+                )
+            if KTransformersPlugin is None:
+                raise ImportError(
+                    "KTransformersPlugin could not be imported from `accelerate`. Please upgrade to a version that includes it."
+                )
+            if isinstance(kt_config_dict, dict):
+                args["kt_config"] = KTransformersPlugin(**kt_config_dict)
+            elif isinstance(kt_config_dict, KTransformersPlugin):
+                args["kt_config"] = kt_config_dict
+            else:
+                raise TypeError("`kt_config` must be a dict or KTransformersPlugin instance.")
 
         # We defer compatibility checks to accelerator
         if self.args.parallelism_config is not None:
@@ -5522,6 +5700,7 @@ class Trainer:
         self.is_deepspeed_enabled = getattr(self.accelerator.state, "deepspeed_plugin", None) is not None
         self.is_fsdp_enabled = getattr(self.accelerator.state, "fsdp_plugin", None) is not None
         self.is_tp_enabled = getattr(self.accelerator.state, "torch_tp_plugin", None) is not None
+        self.is_kt_enabled = _accelerate_supports_kt_config and getattr(self.accelerator.state, "kt_config", None) is not None
         # post accelerator creation setup
         if self.is_fsdp_enabled:
             fsdp_plugin = self.accelerator.state.fsdp_plugin

@@ -481,6 +481,8 @@ def load_state_dict(
     Reads a `safetensor` or a `.bin` checkpoint file. We load the checkpoint on "cpu" by default.
     """
     skip_kt_experts = is_kt_expert_loading_enabled()
+    if skip_kt_experts:
+        print(f"[KT load_state_dict] Skipping expert keys from checkpoint: {checkpoint_file}")
     kt_expert_regex = re.compile(r"\.experts\.\d+\.")
     # Use safetensors if possible
     if checkpoint_file.endswith(".safetensors"):
@@ -866,38 +868,52 @@ def load_shard_file(args):
             device_mesh=device_mesh,
         )
 
-    # If KT is enabled and experts were skipped, load expert weights directly from this shard (CPU) to the model.
-    # Note: Expert keys were filtered out in load_state_dict(), so we need to check directly in the file.
+    # If KT is enabled and experts were skipped, decide whether to load expert weights from the HF checkpoint.
+    # When kt_weight_path is set, KT will load pre-quantized expert weights directly from that path,
+    # so we must NOT load BF16 expert weights from the checkpoint (otherwise the pre-quantized path is bypassed).
     if kt_expert_key_mapping:
-        expert_state: dict[str, torch.Tensor] = {}
-        expert_keys_in_shard = []
-        if shard_file.endswith(".safetensors"):
-            # For safetensors: directly check in the file since expert keys were filtered from state_dict
-            with safe_open(shard_file, framework="pt") as f:
-                shard_keys = set(f.keys())
-                expert_keys_in_shard = [k for k in kt_expert_key_mapping if k in shard_keys]
-                for k in expert_keys_in_shard:
-                    expert_state[kt_expert_key_mapping[k]] = f.get_tensor(k)
-        else:
-            # For .bin files: reload the full state dict to get expert keys
-            full_state_dict = torch.load(shard_file, map_location="cpu", weights_only=weights_only)
-            expert_keys_in_shard = [k for k in kt_expert_key_mapping if k in full_state_dict]
-            for k in expert_keys_in_shard:
-                expert_state[kt_expert_key_mapping[k]] = full_state_dict[k]
+        kt_config = _get_kt_config()
+        kt_weight_path = getattr(kt_config, "kt_weight_path", None) if kt_config is not None else None
 
-        if expert_state:
-            expert_reverse = {v: k for k, v in kt_expert_key_mapping.items() if k in expert_keys_in_shard}
-            disk_offload_index = _load_state_dict_into_meta_model(
-                model,
-                expert_state,
-                shard_file,
-                expert_reverse,
-                device_map=device_map,
-                disk_offload_folder=disk_offload_folder,
-                disk_offload_index=disk_offload_index,
-                hf_quantizer=hf_quantizer,
-                keep_in_fp32_regex=keep_in_fp32_regex,
-                device_mesh=device_mesh,
+        if not kt_weight_path:
+            print(
+                f"[KT load_shard_file] kt_weight_path not set, loading {len(kt_expert_key_mapping)} expert keys "
+                f"from HF checkpoint shard: {shard_file}"
+            )
+            # No pre-quantized weight path: load expert weights from the HF checkpoint as BF16
+            expert_state: dict[str, torch.Tensor] = {}
+            expert_keys_in_shard = []
+            if shard_file.endswith(".safetensors"):
+                with safe_open(shard_file, framework="pt") as f:
+                    shard_keys = set(f.keys())
+                    expert_keys_in_shard = [k for k in kt_expert_key_mapping if k in shard_keys]
+                    for k in expert_keys_in_shard:
+                        expert_state[kt_expert_key_mapping[k]] = f.get_tensor(k)
+            else:
+                full_state_dict = torch.load(shard_file, map_location="cpu", weights_only=weights_only)
+                expert_keys_in_shard = [k for k in kt_expert_key_mapping if k in full_state_dict]
+                for k in expert_keys_in_shard:
+                    expert_state[kt_expert_key_mapping[k]] = full_state_dict[k]
+
+            if expert_state:
+                expert_reverse = {v: k for k, v in kt_expert_key_mapping.items() if k in expert_keys_in_shard}
+                disk_offload_index = _load_state_dict_into_meta_model(
+                    model,
+                    expert_state,
+                    shard_file,
+                    expert_reverse,
+                    device_map=device_map,
+                    disk_offload_folder=disk_offload_folder,
+                    disk_offload_index=disk_offload_index,
+                    hf_quantizer=hf_quantizer,
+                    keep_in_fp32_regex=keep_in_fp32_regex,
+                    device_mesh=device_mesh,
+                )
+
+        else:
+            print(
+                f"[KT load_shard_file] kt_weight_path={kt_weight_path!r}, SKIPPING {len(kt_expert_key_mapping)} "
+                f"expert keys from HF checkpoint (will load pre-quantized weights from kt_weight_path later)"
             )
 
         # stash shard info on KT config for later runtime use
@@ -5403,6 +5419,13 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
             key_renaming_mapping = {
                 k: v for k, v in key_renaming_mapping.items() if not kt_expert_regex.search(v)
             }
+            kt_config = _get_kt_config()
+            kt_wpath = getattr(kt_config, "kt_weight_path", None) if kt_config is not None else None
+            print(
+                f"[KT _load_pretrained_model] skip_kt_experts=True, "
+                f"filtered {len(kt_expert_key_mapping)} expert keys from main loading, "
+                f"kt_weight_path={kt_wpath!r}"
+            )
         checkpoint_keys = list(key_renaming_mapping.values())
 
         # Find missing and unexpected keys from the state dict

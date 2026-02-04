@@ -902,12 +902,12 @@ def load_shard_file(args):
                     expert_state,
                     shard_file,
                     expert_reverse,
-                    device_map=device_map,
+                    device_map={"": "cpu"},
                     disk_offload_folder=disk_offload_folder,
                     disk_offload_index=disk_offload_index,
-                    hf_quantizer=hf_quantizer,
+                    hf_quantizer=None,
                     keep_in_fp32_regex=keep_in_fp32_regex,
-                    device_mesh=device_mesh,
+                    device_mesh=None,
                 )
 
         else:

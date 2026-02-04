@@ -2767,10 +2767,14 @@ class Trainer:
                                     t_grads = [p.grad for p in t_params if p.grad is not None]
                                     dt_with_grad = [p for p in dt_params if p.grad is not None]
 
-                                    # Compute plain tensor grad norm (foreach-batched)
+                                    # Compute plain tensor grad norm (foreach-batched, grouped by device)
                                     if t_grads:
-                                        t_norms = torch._foreach_norm(t_grads, 2)
-                                        t_total_norm_sq = float(torch.stack(t_norms).square().sum())
+                                        from torch.utils._foreach_utils import _group_tensors_by_device_and_dtype
+                                        grouped = _group_tensors_by_device_and_dtype([t_grads])
+                                        t_total_norm_sq = 0.0
+                                        for (device, _), ([device_grads], _) in grouped.items():
+                                            device_norms = torch._foreach_norm(device_grads, 2)
+                                            t_total_norm_sq += float(torch.stack(device_norms).square().sum())
                                     else:
                                         t_total_norm_sq = 0.0
 
@@ -2785,9 +2789,11 @@ class Trainer:
 
                                     if total_norm > args.max_grad_norm:
                                         clip_coef = args.max_grad_norm / (total_norm + 1e-6)
-                                        # Clip plain tensors (foreach-batched)
+                                        # Clip plain tensors (foreach-batched, grouped by device)
                                         if t_grads:
-                                            torch._foreach_mul_(t_grads, clip_coef)
+                                            grouped = _group_tensors_by_device_and_dtype([t_grads])
+                                            for (device, _), ([device_grads], _) in grouped.items():
+                                                torch._foreach_mul_(device_grads, clip_coef)
                                         # Clip DTensors via their local tensors (foreach-batched)
                                         if dt_with_grad:
                                             dt_local_grads = [p.grad._local_tensor for p in dt_with_grad]

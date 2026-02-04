@@ -5140,6 +5140,27 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
                 key_mapping=key_mapping,
                 weights_only=weights_only,
             )
+        # KT wrapping: if KT expert loading is enabled, wrap MoE layers with KT kernel
+        # before tie_weights so the model is returned in KT-wrapped state.
+        if is_kt_expert_loading_enabled():
+            kt_config = _get_kt_config()
+            if kt_config is not None:
+                try:
+                    from accelerate.utils.kt_moe import wrap_moe_layers_with_kt_wrapper
+
+                    # checkpoint_files and sharded_metadata are already stashed on kt_config
+                    # by load_shard_file; ensure they're available for wrapping.
+                    if getattr(kt_config, "kt_checkpoint_files", None) is None and checkpoint_files is not None:
+                        kt_config.kt_checkpoint_files = checkpoint_files
+                    if getattr(kt_config, "kt_sharded_metadata", None) is None and sharded_metadata is not None:
+                        kt_config.kt_sharded_metadata = sharded_metadata
+
+                    wrappers = wrap_moe_layers_with_kt_wrapper(model, kt_config)
+                    model._kt_wrappers = wrappers
+                    logger.info(f"[KT] Wrapped {len(wrappers)} MoE layers in from_pretrained")
+                except Exception as e:
+                    logger.warning(f"[KT] Failed to wrap MoE layers in from_pretrained: {e}")
+
         # make sure token embedding weights are still tied if needed
         model.tie_weights()
 
@@ -5576,7 +5597,8 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
         if skip_kt_experts:
             # If expert weights were skipped during loading, they may still live on the meta device. That breaks
             # downstream `.to()` calls (including dispatching for single-device `device_map`). Replace them with
-            # lightweight placeholders; KT will supply real expert weights via its own wrapper.
+            # lightweight CPU placeholders that preserve shape (for PEFT LoRA discovery).
+            # torch.empty on CPU allocates virtual memory only — no RSS until pages are touched.
             for name, param in model.named_parameters(recurse=True):
                 if param.device.type != "meta" or not kt_expert_regex.search(name):
                     continue
@@ -5584,7 +5606,7 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
                 setattr(
                     module,
                     param_name,
-                    nn.Parameter(torch.empty(0, device="cpu", dtype=param.dtype), requires_grad=False),
+                    nn.Parameter(torch.empty(param.shape, device="cpu", dtype=param.dtype), requires_grad=False),
                 )
 
         # Save offloaded index if needed

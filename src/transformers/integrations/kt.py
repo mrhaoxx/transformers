@@ -42,6 +42,19 @@ class HfTrainerKTConfig:
             return cfg.get(key, default)
         return getattr(cfg, key, default)
 
+    def __getattr__(self, name: str) -> Any:
+        # Allow transparent access to all kt_config dict keys via getattr.
+        # This is needed because wrap_moe_layers_with_kt_wrapper accesses
+        # kt_backend, kt_num_threads, kt_checkpoint_files, etc. via getattr.
+        if name.startswith("_"):
+            raise AttributeError(name)
+        cfg = self.__dict__.get("_kt_config", {})
+        if isinstance(cfg, dict) and name in cfg:
+            return cfg[name]
+        if hasattr(cfg, name):
+            return getattr(cfg, name)
+        raise AttributeError(f"'{type(self).__name__}' has no attribute '{name}'")
+
     @property
     def enabled(self) -> bool:
         enabled = self._get("enabled", None)

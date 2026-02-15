@@ -481,7 +481,7 @@ def load_state_dict(
     Reads a `safetensor` or a `.bin` checkpoint file. We load the checkpoint on "cpu" by default.
     """
     skip_kt_experts = is_kt_expert_loading_enabled()
-    if skip_kt_experts:
+    if skip_kt_experts and os.environ.get("ACCELERATE_KT_DEBUG", "0") == "1":
         print(f"[KT load_state_dict] Skipping expert keys from checkpoint: {checkpoint_file}")
     kt_expert_regex = re.compile(r"\.experts\.\d+\.")
     # Use safetensors if possible
@@ -876,10 +876,11 @@ def load_shard_file(args):
         kt_weight_path = getattr(kt_config, "kt_weight_path", None) if kt_config is not None else None
 
         if not kt_weight_path:
-            print(
-                f"[KT load_shard_file] kt_weight_path not set, loading {len(kt_expert_key_mapping)} expert keys "
-                f"from HF checkpoint shard: {shard_file}"
-            )
+            if os.environ.get("ACCELERATE_KT_DEBUG", "0") == "1":
+                print(
+                    f"[KT load_shard_file] kt_weight_path not set, loading {len(kt_expert_key_mapping)} expert keys "
+                    f"from HF checkpoint shard: {shard_file}"
+                )
             # No pre-quantized weight path: load expert weights from the HF checkpoint as BF16
             expert_state: dict[str, torch.Tensor] = {}
             expert_keys_in_shard = []
@@ -911,10 +912,11 @@ def load_shard_file(args):
                 )
 
         else:
-            print(
-                f"[KT load_shard_file] kt_weight_path={kt_weight_path!r}, SKIPPING {len(kt_expert_key_mapping)} "
-                f"expert keys from HF checkpoint (will load pre-quantized weights from kt_weight_path later)"
-            )
+            if os.environ.get("ACCELERATE_KT_DEBUG", "0") == "1":
+                print(
+                    f"[KT load_shard_file] kt_weight_path={kt_weight_path!r}, SKIPPING {len(kt_expert_key_mapping)} "
+                    f"expert keys from HF checkpoint (will load pre-quantized weights from kt_weight_path later)"
+                )
 
         # stash shard info on KT config for later runtime use
         kt_config = _get_kt_config()
@@ -5442,11 +5444,12 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
             }
             kt_config = _get_kt_config()
             kt_wpath = getattr(kt_config, "kt_weight_path", None) if kt_config is not None else None
-            print(
-                f"[KT _load_pretrained_model] skip_kt_experts=True, "
-                f"filtered {len(kt_expert_key_mapping)} expert keys from main loading, "
-                f"kt_weight_path={kt_wpath!r}"
-            )
+            if os.environ.get("ACCELERATE_KT_DEBUG", "0") == "1":
+                print(
+                    f"[KT _load_pretrained_model] skip_kt_experts=True, "
+                    f"filtered {len(kt_expert_key_mapping)} expert keys from main loading, "
+                    f"kt_weight_path={kt_wpath!r}"
+                )
         checkpoint_keys = list(key_renaming_mapping.values())
 
         # Find missing and unexpected keys from the state dict

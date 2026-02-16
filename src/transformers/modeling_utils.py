@@ -868,55 +868,24 @@ def load_shard_file(args):
             device_mesh=device_mesh,
         )
 
-    # If KT is enabled and experts were skipped, decide whether to load expert weights from the HF checkpoint.
-    # When kt_weight_path is set, KT will load pre-quantized expert weights directly from that path,
-    # so we must NOT load BF16 expert weights from the checkpoint (otherwise the pre-quantized path is bypassed).
+    # If KT is enabled and experts were skipped, do NOT load BF16 expert weights
+    # into model params. The KT wrapping loop will load expert weights per-layer
+    # directly from checkpoint files via load_experts_from_checkpoint_files(),
+    # quantize them to INT8, and discard the BF16 immediately.
+    # Loading BF16 experts here would waste ~1218 GB RAM for 671B models
+    # (all expert weights loaded at once) while wrapping only needs ~21 GB/layer.
+    # Expert params stay on meta device; the post-loading placeholder code
+    # (after all shards) replaces them with lightweight CPU tensors for PEFT discovery.
     if kt_expert_key_mapping:
         kt_config = _get_kt_config()
         kt_weight_path = getattr(kt_config, "kt_weight_path", None) if kt_config is not None else None
 
-        if not kt_weight_path:
-            if os.environ.get("ACCELERATE_KT_DEBUG", "0") == "1":
-                print(
-                    f"[KT load_shard_file] kt_weight_path not set, loading {len(kt_expert_key_mapping)} expert keys "
-                    f"from HF checkpoint shard: {shard_file}"
-                )
-            # No pre-quantized weight path: load expert weights from the HF checkpoint as BF16
-            expert_state: dict[str, torch.Tensor] = {}
-            expert_keys_in_shard = []
-            if shard_file.endswith(".safetensors"):
-                with safe_open(shard_file, framework="pt") as f:
-                    shard_keys = set(f.keys())
-                    expert_keys_in_shard = [k for k in kt_expert_key_mapping if k in shard_keys]
-                    for k in expert_keys_in_shard:
-                        expert_state[kt_expert_key_mapping[k]] = f.get_tensor(k)
-            else:
-                full_state_dict = torch.load(shard_file, map_location="cpu", weights_only=weights_only)
-                expert_keys_in_shard = [k for k in kt_expert_key_mapping if k in full_state_dict]
-                for k in expert_keys_in_shard:
-                    expert_state[kt_expert_key_mapping[k]] = full_state_dict[k]
-
-            if expert_state:
-                expert_reverse = {v: k for k, v in kt_expert_key_mapping.items() if k in expert_keys_in_shard}
-                disk_offload_index = _load_state_dict_into_meta_model(
-                    model,
-                    expert_state,
-                    shard_file,
-                    expert_reverse,
-                    device_map={"": "cpu"},
-                    disk_offload_folder=disk_offload_folder,
-                    disk_offload_index=disk_offload_index,
-                    hf_quantizer=None,
-                    keep_in_fp32_regex=keep_in_fp32_regex,
-                    device_mesh=None,
-                )
-
-        else:
-            if os.environ.get("ACCELERATE_KT_DEBUG", "0") == "1":
-                print(
-                    f"[KT load_shard_file] kt_weight_path={kt_weight_path!r}, SKIPPING {len(kt_expert_key_mapping)} "
-                    f"expert keys from HF checkpoint (will load pre-quantized weights from kt_weight_path later)"
-                )
+        if os.environ.get("ACCELERATE_KT_DEBUG", "0") == "1":
+            print(
+                f"[KT load_shard_file] SKIPPING {len(kt_expert_key_mapping)} expert keys "
+                f"from shard {shard_file} (kt_weight_path={kt_weight_path!r}, "
+                f"wrapping loop loads from checkpoint files directly)"
+            )
 
         # stash shard info on KT config for later runtime use
         kt_config = _get_kt_config()
@@ -5442,6 +5411,31 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
             key_renaming_mapping = {
                 k: v for k, v in key_renaming_mapping.items() if not kt_expert_regex.search(v)
             }
+
+            # Filter out expert keys for layers that don't exist in the model.
+            # E.g. unsloth-converted DeepSeek-V3 checkpoints store MTP prediction
+            # layers as model.layers.<num_hidden_layers>.* but the modeling code only
+            # creates num_hidden_layers layers (indices 0..num_hidden_layers-1).
+            # These keys bypassed _find_missing_and_unexpected_keys() because they
+            # were split into kt_expert_key_mapping before that check runs.
+            num_layers = getattr(model.config, "num_hidden_layers", None)
+            if num_layers is not None:
+                _layer_idx_re = re.compile(r"model\.layers\.(\d+)\.")
+                _before = len(kt_expert_key_mapping)
+                kt_expert_key_mapping = {
+                    k: v
+                    for k, v in kt_expert_key_mapping.items()
+                    if not (
+                        (m := _layer_idx_re.search(v)) and int(m.group(1)) >= num_layers
+                    )
+                }
+                _dropped = _before - len(kt_expert_key_mapping)
+                if _dropped > 0:
+                    logger.warning_once(
+                        f"Dropped {_dropped} expert checkpoint keys for layer indices >= {num_layers} "
+                        f"(e.g. MTP/multi-token-prediction layers). These weights are not needed for training."
+                    )
+
             kt_config = _get_kt_config()
             kt_wpath = getattr(kt_config, "kt_weight_path", None) if kt_config is not None else None
             if os.environ.get("ACCELERATE_KT_DEBUG", "0") == "1":

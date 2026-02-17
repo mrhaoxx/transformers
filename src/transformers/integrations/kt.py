@@ -31,9 +31,50 @@ class HfTrainerKTConfig:
     `TrainingArguments` stores a reference to it on `self.hf_kt_config`.
     """
 
+    # Mapping from kt_config dict keys to ACCELERATE_KT_* environment variables.
+    # Used to populate missing config values from env vars set by `accelerate launch`.
+    _ENV_MAPPING: dict[str, tuple[str, type]] = {
+        "kt_backend": ("ACCELERATE_KT_BACKEND", str),
+        "kt_num_gpu_experts": ("ACCELERATE_KT_NUM_GPU_EXPERTS", int),
+        "kt_num_threads": ("ACCELERATE_KT_NUM_THREADS", int),
+        "kt_tp_enabled": ("ACCELERATE_KT_TP_ENABLED", bool),
+        "kt_threadpool_count": ("ACCELERATE_KT_THREADPOOL_COUNT", int),
+        "kt_max_cache_depth": ("ACCELERATE_KT_MAX_CACHE_DEPTH", int),
+        "kt_weight_path": ("ACCELERATE_KT_WEIGHT_PATH", str),
+        "kt_use_lora_experts": ("ACCELERATE_KT_USE_LORA_EXPERTS", bool),
+        "kt_lora_expert_num": ("ACCELERATE_KT_LORA_EXPERT_NUM", int),
+        "kt_lora_expert_intermediate_size": ("ACCELERATE_KT_LORA_EXPERT_INTERMEDIATE_SIZE", int),
+        "lora_rank": ("ACCELERATE_KT_LORA_RANK", int),
+        "lora_alpha": ("ACCELERATE_KT_LORA_ALPHA", float),
+        "model_max_length": ("ACCELERATE_KT_MODEL_MAX_LENGTH", int),
+        "kt_skip_expert_loading": ("ACCELERATE_KT_SKIP_EXPERT_LOADING", bool),
+    }
+
     def __init__(self, kt_config_dict: Any | None):
         # Keep a reference to the original config so later mutations (e.g. filling defaults) are reflected here.
         self._kt_config = kt_config_dict if kt_config_dict is not None else {}
+
+        # Fill missing config values from ACCELERATE_KT_* env vars.
+        # These are set by `accelerate launch --config_file` via _apply_kt_config_to_env()
+        # before the training script starts, but kt_config_dict may be None/empty when
+        # TrainingArguments.__post_init__ runs (e.g. when kt_config is not passed explicitly
+        # and the only signal is the ACCELERATE_USE_KT env var).
+        if isinstance(self._kt_config, dict):
+            for key, (env_key, typ) in self._ENV_MAPPING.items():
+                if key in self._kt_config:
+                    continue
+                env_val = os.environ.get(env_key)
+                if env_val is None or env_val == "":
+                    continue
+                if typ is bool:
+                    self._kt_config[key] = env_val.lower() in ("1", "true", "yes")
+                elif typ is int:
+                    self._kt_config[key] = int(env_val)
+                elif typ is float:
+                    self._kt_config[key] = float(env_val)
+                else:
+                    self._kt_config[key] = env_val
+
         set_kt_config(self)
 
     def _get(self, key: str, default: Any = None) -> Any:

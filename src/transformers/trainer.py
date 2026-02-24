@@ -241,6 +241,7 @@ if is_accelerate_available():
             KTransformersPlugin,
             get_kt_lora_params,
             kt_adapt_peft_lora,
+            load_kt_moe_from_adapter,
             save_kt_moe_to_adapter,
             sync_kt_lora_gradients,
             update_kt_lora_pointers,
@@ -249,7 +250,7 @@ if is_accelerate_available():
         _accelerate_supports_kt_config = "kt_config" in inspect.signature(Accelerator).parameters
     except ImportError:
         KTransformersPlugin = None
-        get_kt_lora_params = kt_adapt_peft_lora = save_kt_moe_to_adapter = sync_kt_lora_gradients = update_kt_lora_pointers = None
+        get_kt_lora_params = kt_adapt_peft_lora = load_kt_moe_from_adapter = save_kt_moe_to_adapter = sync_kt_lora_gradients = update_kt_lora_pointers = None
 
     DATA_SAMPLERS = [RandomSampler]
     if version.parse(accelerate_version) > version.parse("1.3.0"):
@@ -2701,14 +2702,15 @@ class Trainer:
                                 wrapper._kt_fused_lora_params = fused_params
 
                     if storage_to_fused_param:
+                        # Only fuse CPU LoRA buffer params (from C++ kernel), not GPU lora_experts params
                         kt_lora_params = get_kt_lora_params(kt_model)
-                        kt_lora_param_ids = {id(p) for p in kt_lora_params}
+                        kt_cpu_lora_param_ids = {id(p) for p in kt_lora_params if p.device.type == "cpu"}
                         added_fused_ids = set()
                         for group in raw_opt.param_groups:
                             kept_params = []
                             removed_storage_ptrs = []
                             for param in group["params"]:
-                                if id(param) in kt_lora_param_ids:
+                                if id(param) in kt_cpu_lora_param_ids:
                                     removed_storage_ptrs.append(param.untyped_storage().data_ptr())
                                 else:
                                     kept_params.append(param)
@@ -2722,7 +2724,7 @@ class Trainer:
                         self._kt_fused_optimizer_params = list(storage_to_fused_param.values())
                         logger.info(
                             "[KT] FSDP2 optimizer fusion: %d fused buffer params replace %d individual params",
-                            len(storage_to_fused_param), len(kt_lora_param_ids),
+                            len(storage_to_fused_param), len(kt_cpu_lora_param_ids),
                         )
                 else:
                     # Non-rank-0: remove CPU params from optimizer (KT MoE only runs on rank 0)
@@ -2744,6 +2746,11 @@ class Trainer:
                 )
             elif is_sagemaker_mp_enabled() or self.is_fsdp_enabled:
                 self._load_from_checkpoint(resume_from_checkpoint, self.model_wrapped)
+
+        # Load KT MoE lora_experts weights from checkpoint (if any)
+        if self.is_kt_enabled and load_kt_moe_from_adapter is not None and resume_from_checkpoint is not None:
+            kt_model = self.accelerator.unwrap_model(self.model, keep_torch_compile=False)
+            load_kt_moe_from_adapter(kt_model, resume_from_checkpoint)
 
         # Check if saved optimizer or scheduler states exist
         self._load_optimizer_and_scheduler(resume_from_checkpoint)
@@ -2906,15 +2913,14 @@ class Trainer:
                     if step % args.gradient_accumulation_steps == 0:
                         self.control = self.callback_handler.on_step_begin(args, self.state, self.control)
 
-                    # We explicitly want to avoid relying on `accelerator.accumulate` for generation training.
-                    # KT + FSDP2 + non-reentrant checkpointing can accumulate activation state across no_sync micro-steps.
-                    # In that case, force sync each micro-step as a correctness/memory safeguard.
-                    model_gc_enabled = bool(getattr(model, "is_gradient_checkpointing", False))
-                    if not model_gc_enabled and hasattr(model, "module"):
-                        model_gc_enabled = bool(getattr(model.module, "is_gradient_checkpointing", False))
-                    # FSDP/FSDP2 wrappers may not expose `is_gradient_checkpointing`; trust TrainingArguments as source of truth.
-                    gc_enabled = bool(getattr(args, "gradient_checkpointing", False) or model_gc_enabled)
-                    disable_no_sync = bool(getattr(self, "is_kt_enabled", False) and gc_enabled)
+                    # Disabled by local patch: do not override `no_sync` behavior for KT/GC.
+                    # model_gc_enabled = bool(getattr(model, "is_gradient_checkpointing", False))
+                    # if not model_gc_enabled and hasattr(model, "module"):
+                    #     model_gc_enabled = bool(getattr(model.module, "is_gradient_checkpointing", False))
+                    # gc_enabled = bool(getattr(args, "gradient_checkpointing", False) or model_gc_enabled)
+                    # disable_no_sync = bool(getattr(self, "is_kt_enabled", False) and gc_enabled)
+                    model_gc_enabled = False
+                    disable_no_sync = False
 
                     if (
                         os.environ.get("ACCELERATE_KT_MEM_LOG", "0") == "1"
@@ -4856,14 +4862,22 @@ class Trainer:
                             name for name, p in unwrapped.named_parameters() if p.requires_grad
                         }
                         adapter_state = {k: v for k, v in state_dict.items() if k in trainable_keys}
-                        # Save via PEFT's save_pretrained with explicit state_dict
+                        # Split: PEFT saves its own keys, lora_experts saved separately
+                        le_state = {k: v for k, v in adapter_state.items() if "lora_experts" in k}
+                        peft_state = {k: v for k, v in adapter_state.items() if "lora_experts" not in k}
+
                         if isinstance(unwrapped, PeftModel):
                             unwrapped.save_pretrained(
                                 output_dir,
-                                state_dict=adapter_state,
+                                state_dict=peft_state,
                                 safe_serialization=self.args.save_safetensors,
                             )
-                        # Note: KT MoE LoRA is managed by PEFT and already saved by save_pretrained above.
+                        # Append lora_experts into the adapter file saved by PEFT
+                        if le_state:
+                            from safetensors.torch import save_file as _save_file
+                            le_file = os.path.join(output_dir, "lora_experts.safetensors")
+                            _save_file(le_state, le_file, metadata={"format": "pt"})
+                            logger.info(f"[KT] Saved {len(le_state)} lora_experts tensors to {le_file}")
                         if self.processing_class is not None:
                             self.processing_class.save_pretrained(output_dir)
                         torch.save(self.args, os.path.join(output_dir, TRAINING_ARGS_NAME))
@@ -5009,8 +5023,10 @@ class Trainer:
         # Good practice: save your training arguments together with the trained model
         torch.save(self.args, os.path.join(output_dir, TRAINING_ARGS_NAME))
 
+        print(f"[trainer save] is_kt_enabled={self.is_kt_enabled}, should_save={self.args.should_save}", flush=True)
         if self.is_kt_enabled and self.args.should_save:
             kt_model = self.accelerator.unwrap_model(self.model, keep_torch_compile=False)
+            print(f"[trainer save] unwrapped model type={type(kt_model).__name__}, calling save_kt_moe_to_adapter", flush=True)
             save_kt_moe_to_adapter(kt_model, output_dir)
 
     def store_flos(self):
